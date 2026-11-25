@@ -23,7 +23,7 @@ console.log("⚡ InstaMediaPro_bot (Tezkor Qidiruv + Tanlov Tugmalari + Instagra
 // 1. YouTube trekini tezkor yuklab olish
 async function downloadTrackFromYt(track, outBase) {
   try {
-    const client = new Ytdl();
+    const client = new Ytdl({ clients: ["visionos"] });
     const info = await client.getInfo(track.url);
 
     const m4a = info.formats.find((f) => f.itag === 140 && f.url);
