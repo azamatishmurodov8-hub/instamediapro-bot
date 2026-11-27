@@ -48,9 +48,50 @@ async function resetYtdl() {
 // Bot boshlanishi bilan PO-Token provayderini tayyorlab qo'yish
 getYtdl().catch(() => {});
 
+const YTDLP_BIN = fs.existsSync("/usr/local/bin/yt-dlp")
+  ? "/usr/local/bin/yt-dlp"
+  : fs.existsSync("/usr/bin/yt-dlp")
+  ? "/usr/bin/yt-dlp"
+  : "yt-dlp";
+
+async function downloadWithYtDlp(url, outBase) {
+  return new Promise((resolve) => {
+    const cmd = `"${YTDLP_BIN}" --no-warnings --no-playlist --extractor-args "youtube:player_client=android,web" -f "ba/b" -x --audio-format m4a -o "${outBase}.%(ext)s" "${url}"`;
+    exec(cmd, { timeout: 45000 }, (err) => {
+      if (err) {
+        console.error("yt-dlp xatosi:", err.message);
+      }
+      const files = [`${outBase}.m4a`, `${outBase}.mp3`, `${outBase}.opus`, `${outBase}.webm`];
+      for (const f of files) {
+        if (fs.existsSync(f) && fs.statSync(f).size > 100000) {
+          return resolve(f);
+        }
+      }
+      resolve(null);
+    });
+  });
+}
+
 // 1. YouTube trekini tezkor yuklab olish
 async function downloadTrackFromYt(trackOrUrl, outBase) {
   const url = typeof trackOrUrl === "string" ? trackOrUrl : trackOrUrl.url;
+
+  // A) 1-USUL: yt-dlp orqali (Android emulyatsiyasi - bulutli serverlar va Railway uchun eng ishonchli!)
+  try {
+    const dlFile = await downloadWithYtDlp(url, outBase);
+    if (dlFile && fs.existsSync(dlFile)) {
+      return {
+        path: dlFile,
+        title: typeof trackOrUrl === "object" ? trackOrUrl.title : "Musiqa",
+        author: typeof trackOrUrl === "object" ? trackOrUrl.author?.name : "Artist",
+        duration: typeof trackOrUrl === "object" ? trackOrUrl.timestamp : "3:00",
+      };
+    }
+  } catch (e) {
+    console.error("yt-dlp urinishi xatosi:", e.message);
+  }
+
+  // B) 2-USUL: @distube/ytdl-core orqali zaxira yuklash
   for (let attempt = 1; attempt <= 2; attempt++) {
     try {
       const client = await getYtdl();
