@@ -20,6 +20,13 @@ const mediaStore = new Map();
 
 console.log("⚡ InstaMediaPro_bot (Tezkor Qidiruv + Tanlov Tugmalari + Instagram) ishga tushmoqda...");
 
+function escapeHtml(str) {
+  return String(str || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
 let poTokenProvider = null;
 let ytdlClient = null;
 
@@ -45,9 +52,6 @@ async function resetYtdl() {
   ytdlClient = null;
 }
 
-// Bot boshlanishi bilan PO-Token provayderini tayyorlab qo'yish
-getYtdl().catch(() => {});
-
 const YTDLP_BIN = fs.existsSync("/usr/local/bin/yt-dlp")
   ? "/usr/local/bin/yt-dlp"
   : fs.existsSync("/usr/bin/yt-dlp")
@@ -56,14 +60,23 @@ const YTDLP_BIN = fs.existsSync("/usr/local/bin/yt-dlp")
 
 async function downloadWithYtDlp(url, outBase) {
   return new Promise((resolve) => {
-    const cmd = `"${YTDLP_BIN}" --no-warnings --no-playlist --extractor-args "youtube:player_client=android,web" -f "ba/b" -x --audio-format m4a -o "${outBase}.%(ext)s" "${url}"`;
-    exec(cmd, { timeout: 45000 }, (err) => {
+    const cmd = `"${YTDLP_BIN}" --no-warnings --no-playlist --extractor-args "youtube:player_client=android,web" -f "ba[ext=m4a]/ba/b" -x --audio-format m4a -o "${outBase}.%(ext)s" "${url}"`;
+    console.log(`⚡ yt-dlp yuklash boshlandi: ${url}`);
+    exec(cmd, { timeout: 45000 }, (err, stdout, stderr) => {
       if (err) {
         console.error("yt-dlp xatosi:", err.message);
+        if (stderr) console.error("yt-dlp stderr:", stderr.slice(0, 300));
       }
-      const files = [`${outBase}.m4a`, `${outBase}.mp3`, `${outBase}.opus`, `${outBase}.webm`];
+      const files = [
+        `${outBase}.m4a`,
+        `${outBase}.mp3`,
+        `${outBase}.opus`,
+        `${outBase}.webm`,
+        `${outBase}.aac`,
+      ];
       for (const f of files) {
-        if (fs.existsSync(f) && fs.statSync(f).size > 100000) {
+        if (fs.existsSync(f) && fs.statSync(f).size > 50000) {
+          console.log(`✅ yt-dlp muvaffaqiyatli fayl yaratdi: ${f} (${fs.statSync(f).size} bayt)`);
           return resolve(f);
         }
       }
@@ -271,6 +284,7 @@ bot.command("start", async (ctx) => {
 // ==========================================
 bot.on("callback_query:data", async (ctx) => {
   const data = ctx.callbackQuery.data;
+  console.log(`🔘 Tugma bosildi [${ctx.from?.id} - ${ctx.from?.first_name}]: "${data}"`);
 
   // A) MUSIQA RO'YXATIDAN BITTA RAQAM TANLANGANDA (dl:videoId yoki dltrack:searchId:index)
   if (data.startsWith("dl:") || data.startsWith("dltrack:")) {
@@ -283,6 +297,15 @@ bot.on("callback_query:data", async (ctx) => {
       const videoId = data.slice(3);
       targetUrl = `https://www.youtube.com/watch?v=${videoId}`;
       await ctx.answerCallbackQuery({ text: "⏳ Musiqa yuklanmoqda..." });
+
+      try {
+        const vInfo = await yts({ videoId });
+        if (vInfo && vInfo.title) {
+          defaultTitle = vInfo.title;
+          defaultAuthor = vInfo.author?.name || "Original Musiqa";
+          defaultDuration = vInfo.duration?.timestamp || "";
+        }
+      } catch (_) {}
     } else {
       const [, searchId, indexStr] = data.split(":");
       const index = parseInt(indexStr, 10);
@@ -304,7 +327,7 @@ bot.on("callback_query:data", async (ctx) => {
     }
 
     const statusMsg = await ctx.reply(
-      `📥 <b>Yuklanmoqda:</b> ${defaultTitle}...`,
+      `📥 <b>Yuklanmoqda:</b> ${escapeHtml(defaultTitle)}...`,
       { parse_mode: "HTML" }
     );
     ctx.replyWithChatAction("upload_voice").catch(() => {});
@@ -320,19 +343,21 @@ bot.on("callback_query:data", async (ctx) => {
       if (musicInfo && fs.existsSync(musicInfo.path)) {
         await ctx.api.deleteMessage(ctx.chat.id, statusMsg.message_id).catch(() => {});
 
-        const safeTitle = (musicInfo.title || defaultTitle).replace(/[^\w\s\-\.\(\)]/gi, "").trim();
+        const finalTitle = musicInfo.title && musicInfo.title !== "Musiqa" ? musicInfo.title : defaultTitle;
+        const finalAuthor = musicInfo.author && musicInfo.author !== "Artist" ? musicInfo.author : defaultAuthor;
+        const safeTitle = finalTitle.replace(/[^\w\s\-\.\(\)]/gi, "").trim();
         const ext = path.extname(musicInfo.path) || ".m4a";
 
         await ctx.replyWithAudio(
           new InputFile(musicInfo.path, `${safeTitle || "Musiqa"}${ext}`),
           {
             caption:
-              `🎵 <b>${musicInfo.title || defaultTitle}</b>\n` +
-              `⏱ <b>Davomiyligi:</b> ${musicInfo.duration || defaultDuration}\n` +
-              `👤 <b>Ijrochi:</b> ${musicInfo.author || defaultAuthor}\n\n` +
+              `🎵 <b>${escapeHtml(finalTitle)}</b>\n` +
+              `⏱ <b>Davomiyligi:</b> ${escapeHtml(musicInfo.duration || defaultDuration)}\n` +
+              `👤 <b>Ijrochi:</b> ${escapeHtml(finalAuthor)}\n\n` +
               `🤖 @InstaMediaPro_bot`,
-            title: musicInfo.title || defaultTitle,
-            performer: musicInfo.author || defaultAuthor,
+            title: finalTitle,
+            performer: finalAuthor,
             parse_mode: "HTML",
           }
         );
@@ -346,7 +371,11 @@ bot.on("callback_query:data", async (ctx) => {
       }
     } catch (e) {
       console.error("dl error:", e.message);
-      await ctx.api.deleteMessage(ctx.chat.id, statusMsg.message_id).catch(() => {});
+      await ctx.api.editMessageText(
+        ctx.chat.id,
+        statusMsg.message_id,
+        "❌ Musiqani yuborishda xatolik yuz berdi."
+      ).catch(() => {});
     }
     return;
   }
@@ -547,6 +576,8 @@ bot.on("message:text", async (ctx) => {
   const text = ctx.message.text.trim();
   if (text.startsWith("/")) return;
 
+  console.log(`📩 Yangi xabar [${ctx.from?.id} - ${ctx.from?.first_name}]: "${text}"`);
+
   const igRegex =
     /(?:https?:\/\/)?(?:www\.)?(?:instagram\.com)\/(?:p|reel|reels|tv)\/([A-Za-z0-9_-]+)/i;
   const igMatch = text.match(igRegex);
@@ -557,7 +588,7 @@ bot.on("message:text", async (ctx) => {
   // ==========================================
   if (!igMatch) {
     const searchWait = await ctx.reply(
-      `🔍 <b>"${text}"</b> bo‘yicha qidirilmoqda...`,
+      `🔍 <b>"${escapeHtml(text)}"</b> bo‘yicha qidirilmoqda...`,
       { parse_mode: "HTML" }
     );
 
@@ -575,7 +606,7 @@ bot.on("message:text", async (ctx) => {
         return await ctx.api.editMessageText(
           ctx.chat.id,
           searchWait.message_id,
-          `❌ Kechirasiz, <b>"${text}"</b> bo‘yicha musiqa topilmadi.`,
+          `❌ Kechirasiz, <b>"${escapeHtml(text)}"</b> bo‘yicha musiqa topilmadi.`,
           { parse_mode: "HTML" }
         ).catch(() => {});
       }
@@ -583,12 +614,12 @@ bot.on("message:text", async (ctx) => {
       const searchId = `s_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
       mediaStore.set(searchId, { tracks, createdAt: Date.now() });
 
-      let msgText = `🔍 <b>"${text}" bo‘yicha topilgan musiqalar:</b>\n\n`;
+      let msgText = `🔍 <b>"${escapeHtml(text)}" bo‘yicha topilgan musiqalar:</b>\n\n`;
       const keyboard = new InlineKeyboard();
 
       const numEmojis = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"];
       tracks.forEach((track, index) => {
-        msgText += `${numEmojis[index]} <b>${track.title}</b> (${track.timestamp})\n`;
+        msgText += `${numEmojis[index]} <b>${escapeHtml(track.title)}</b> (${track.timestamp})\n`;
         const cb = track.videoId ? `dl:${track.videoId}` : `dltrack:${searchId}:${index}`;
         keyboard.text(numEmojis[index], cb);
       });
@@ -715,7 +746,25 @@ bot.on("message:text", async (ctx) => {
 });
 
 bot.catch((err) => {
-  console.error("Bot xatosi:", err.message);
+  console.error("Bot middleware xatosi:", err.message);
 });
 
-bot.start();
+async function runBot() {
+  console.log("🚀 InstaMediaPro Bot ishga tushirilmoqda...");
+  while (true) {
+    try {
+      await bot.start({
+        drop_pending_updates: true,
+        onStart: (botInfo) => {
+          console.log(`✅ @${botInfo.username} muvaffaqiyatli ulandi va xabarlarni kutmoqda!`);
+        },
+      });
+    } catch (err) {
+      console.error("⚠️ bot.start xatosi:", err.message);
+      console.log("⏳ 4 soniyadan so'ng qayta ulanadi...");
+      await new Promise((resolve) => setTimeout(resolve, 4000));
+    }
+  }
+}
+
+runBot();
