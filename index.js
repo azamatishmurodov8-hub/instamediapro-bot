@@ -1,11 +1,11 @@
 const { Bot, InputFile, InlineKeyboard } = require("grammy");
 const axios = require("axios");
-const { exec } = require("child_process");
+const { exec, spawn } = require("child_process");
 const fs = require("fs");
 const path = require("path");
 const FormData = require("form-data");
 const yts = require("yt-search");
-const { Ytdl, chooseFormat } = require("@distube/ytdl-core");
+const { Ytdl, chooseFormat, createPoTokenProvider } = require("@distube/ytdl-core");
 
 const BOT_TOKEN = "9116531079:AAH5SvgJ54BQFGraDar5vsurix_txhjRiTI";
 const RAPIDAPI_KEY = "3060c13eb0msh0e38d762e05eff2p17e1ccjsn142f3fe89ca7";
@@ -20,39 +20,108 @@ const mediaStore = new Map();
 
 console.log("⚡ InstaMediaPro_bot (Tezkor Qidiruv + Tanlov Tugmalari + Instagram) ishga tushmoqda...");
 
-// 1. YouTube trekini tezkor yuklab olish
-async function downloadTrackFromYt(track, outBase) {
-  try {
-    const client = new Ytdl({ clients: ["visionos"] });
-    const info = await client.getInfo(track.url);
+let poTokenProvider = null;
+let ytdlClient = null;
 
-    const m4a = info.formats.find((f) => f.itag === 140 && f.url);
-    const format =
-      m4a ||
-      chooseFormat(info.formats, { filter: { hasAudio: true, hasVideo: false } });
-    if (!format || !format.url) return null;
-
-    const isAac = !!m4a || (format.container === "mp4" && format.audioCodec?.includes("mp4a"));
-    const outPath = isAac ? `${outBase}.m4a` : `${outBase}.mp3`;
-
-    const cmd = isAac
-      ? `"${FFMPEG_BIN}" -i "${format.url}" -vn -c:a copy "${outPath}" -y`
-      : `"${FFMPEG_BIN}" -i "${format.url}" -vn -c:a libmp3lame -b:a 128k "${outPath}" -y`;
-
-    await new Promise((resolve) => {
-      exec(cmd, () => resolve());
-    });
-
-    if (fs.existsSync(outPath) && fs.statSync(outPath).size > 100000) {
-      return {
-        path: outPath,
-        title: track.title,
-        author: track.author?.name || "Original Musiqa",
-        duration: track.timestamp || "3:00",
-      };
+async function getYtdl() {
+  if (!ytdlClient) {
+    try {
+      poTokenProvider = await createPoTokenProvider({ timeoutMs: 15000 });
+      ytdlClient = new Ytdl({ getPoToken: poTokenProvider });
+      console.log("✅ YouTube PO-Token provayderi muvaffaqiyatli ishga tushdi");
+    } catch (e) {
+      console.error("⚠️ PO-Token provayder xatosi, oddiy Ytdl rejimiga o'tilmoqda:", e.message);
+      ytdlClient = new Ytdl();
     }
-  } catch (err) {
-    console.error("Yuklash xatosi:", err.message);
+  }
+  return ytdlClient;
+}
+
+async function resetYtdl() {
+  try {
+    if (poTokenProvider) await poTokenProvider.dispose().catch(() => {});
+  } catch (_) {}
+  poTokenProvider = null;
+  ytdlClient = null;
+}
+
+// Bot boshlanishi bilan PO-Token provayderini tayyorlab qo'yish
+getYtdl().catch(() => {});
+
+// 1. YouTube trekini tezkor yuklab olish
+async function downloadTrackFromYt(trackOrUrl, outBase) {
+  const url = typeof trackOrUrl === "string" ? trackOrUrl : trackOrUrl.url;
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const client = await getYtdl();
+      const info = await client.getInfo(url);
+
+      const m4a = info.formats.find((f) => f.itag === 140);
+      const format =
+        m4a ||
+        chooseFormat(info.formats, {
+          quality: "highestaudio",
+          filter: { hasAudio: true, hasVideo: false },
+        }) ||
+        info.formats.find((f) => f.hasAudio);
+
+      if (!format) return null;
+
+      const isDirectM4a = !!m4a || (format.container === "mp4" && format.audioCodec?.includes("mp4a"));
+      const outPath = isDirectM4a ? `${outBase}.m4a` : `${outBase}.mp3`;
+
+      if (isDirectM4a) {
+        const stream = client.download(info, { format });
+        const writer = fs.createWriteStream(outPath);
+        await new Promise((resolve, reject) => {
+          stream.pipe(writer);
+          writer.on("finish", resolve);
+          stream.on("error", reject);
+          writer.on("error", reject);
+        });
+      } else {
+        const outStream = spawn(FFMPEG_BIN, [
+          "-i",
+          "pipe:0",
+          "-vn",
+          "-c:a",
+          "libmp3lame",
+          "-b:a",
+          "192k",
+          outPath,
+          "-y",
+        ]);
+        const stream = client.download(info, { format });
+        stream.pipe(outStream.stdin);
+        await new Promise((resolve, reject) => {
+          outStream.on("close", (code) => {
+            if (code === 0) resolve();
+            else reject(new Error(`ffmpeg exit code ${code}`));
+          });
+          outStream.on("error", reject);
+          stream.on("error", reject);
+        });
+      }
+
+      if (fs.existsSync(outPath) && fs.statSync(outPath).size > 100000) {
+        return {
+          path: outPath,
+          title: info.videoDetails.title || (typeof trackOrUrl === "object" ? trackOrUrl.title : "Musiqa"),
+          author: info.videoDetails.author?.name || (typeof trackOrUrl === "object" ? trackOrUrl.author?.name : "Artist"),
+          duration:
+            info.videoDetails.lengthSeconds
+              ? Math.floor(info.videoDetails.lengthSeconds / 60) +
+                ":" +
+                String(info.videoDetails.lengthSeconds % 60).padStart(2, "0")
+              : (typeof trackOrUrl === "object" ? trackOrUrl.timestamp : "3:00"),
+        };
+      }
+    } catch (err) {
+      console.error(`Yuklash xatosi (urinish ${attempt}):`, err.message);
+      if (attempt === 1) {
+        await resetYtdl();
+      }
+    }
   }
   return null;
 }
@@ -162,24 +231,39 @@ bot.command("start", async (ctx) => {
 bot.on("callback_query:data", async (ctx) => {
   const data = ctx.callbackQuery.data;
 
-  // A) MUSIQA RO'YXATIDAN BITTA RAQAM TANLANGANDA (dltrack:searchId:index)
-  if (data.startsWith("dltrack:")) {
-    const [, searchId, indexStr] = data.split(":");
-    const index = parseInt(indexStr, 10);
-    const searchData = mediaStore.get(searchId);
+  // A) MUSIQA RO'YXATIDAN BITTA RAQAM TANLANGANDA (dl:videoId yoki dltrack:searchId:index)
+  if (data.startsWith("dl:") || data.startsWith("dltrack:")) {
+    let targetUrl = "";
+    let defaultTitle = "Musiqa";
+    let defaultAuthor = "Artist";
+    let defaultDuration = "";
 
-    if (!searchData || !searchData.tracks || !searchData.tracks[index]) {
-      return ctx.answerCallbackQuery({
-        text: "⚠️ Qidiruv natijasi eskirgan. Qaytadan qidiring.",
-        show_alert: true,
-      });
+    if (data.startsWith("dl:")) {
+      const videoId = data.slice(3);
+      targetUrl = `https://www.youtube.com/watch?v=${videoId}`;
+      await ctx.answerCallbackQuery({ text: "⏳ Musiqa yuklanmoqda..." });
+    } else {
+      const [, searchId, indexStr] = data.split(":");
+      const index = parseInt(indexStr, 10);
+      const searchData = mediaStore.get(searchId);
+
+      if (!searchData || !searchData.tracks || !searchData.tracks[index]) {
+        return ctx.answerCallbackQuery({
+          text: "⚠️ Qidiruv natijasi eskirgan. Qaytadan qidiring.",
+          show_alert: true,
+        });
+      }
+
+      const selectedTrack = searchData.tracks[index];
+      targetUrl = selectedTrack.url;
+      defaultTitle = selectedTrack.title;
+      defaultAuthor = selectedTrack.author?.name || "Original Musiqa";
+      defaultDuration = selectedTrack.timestamp || "";
+      await ctx.answerCallbackQuery({ text: `⏳ ${index + 1}-raqamdagi musiqa yuklanmoqda...` });
     }
 
-    const selectedTrack = searchData.tracks[index];
-    await ctx.answerCallbackQuery({ text: `⏳ ${index + 1}-raqamdagi musiqa yuklanmoqda...` });
-
     const statusMsg = await ctx.reply(
-      `📥 <b>Yuklanmoqda:</b> ${selectedTrack.title}...`,
+      `📥 <b>Yuklanmoqda:</b> ${defaultTitle}...`,
       { parse_mode: "HTML" }
     );
     ctx.replyWithChatAction("upload_voice").catch(() => {});
@@ -190,24 +274,24 @@ bot.on("callback_query:data", async (ctx) => {
     const outBase = path.join(tmpDir, `track_${timestamp}`);
 
     try {
-      const musicInfo = await downloadTrackFromYt(selectedTrack, outBase);
+      const musicInfo = await downloadTrackFromYt(targetUrl, outBase);
 
       if (musicInfo && fs.existsSync(musicInfo.path)) {
         await ctx.api.deleteMessage(ctx.chat.id, statusMsg.message_id).catch(() => {});
 
-        const safeTitle = musicInfo.title.replace(/[^\w\s\-\.\(\)]/gi, "").trim();
+        const safeTitle = (musicInfo.title || defaultTitle).replace(/[^\w\s\-\.\(\)]/gi, "").trim();
         const ext = path.extname(musicInfo.path) || ".m4a";
 
         await ctx.replyWithAudio(
           new InputFile(musicInfo.path, `${safeTitle || "Musiqa"}${ext}`),
           {
             caption:
-              `🎵 <b>${musicInfo.title}</b>\n` +
-              `⏱ <b>Davomiyligi:</b> ${musicInfo.duration}\n` +
-              `👤 <b>Ijrochi:</b> ${musicInfo.author}\n\n` +
+              `🎵 <b>${musicInfo.title || defaultTitle}</b>\n` +
+              `⏱ <b>Davomiyligi:</b> ${musicInfo.duration || defaultDuration}\n` +
+              `👤 <b>Ijrochi:</b> ${musicInfo.author || defaultAuthor}\n\n` +
               `🤖 @InstaMediaPro_bot`,
-            title: musicInfo.title,
-            performer: musicInfo.author,
+            title: musicInfo.title || defaultTitle,
+            performer: musicInfo.author || defaultAuthor,
             parse_mode: "HTML",
           }
         );
@@ -216,11 +300,11 @@ bot.on("callback_query:data", async (ctx) => {
         await ctx.api.editMessageText(
           ctx.chat.id,
           statusMsg.message_id,
-          "❌ Musiqani yuklab bo‘lmadi."
+          "❌ Kechirasiz, ushbu musiqani yuklab bo‘lmadi. Boshqa raqamni tanlab ko‘ring."
         ).catch(() => {});
       }
     } catch (e) {
-      console.error("dltrack error:", e.message);
+      console.error("dl error:", e.message);
       await ctx.api.deleteMessage(ctx.chat.id, statusMsg.message_id).catch(() => {});
     }
     return;
@@ -438,11 +522,15 @@ bot.on("message:text", async (ctx) => {
 
     try {
       const r = await yts(text);
-      const tracks = r.videos
-        .filter((v) => v.seconds >= 45 && v.seconds <= 600)
+      let tracks = r.videos
+        .filter((v) => !v.live && (v.seconds === 0 || (v.seconds >= 30 && v.seconds <= 900)))
         .slice(0, 5);
 
-      if (tracks.length === 0) {
+      if (tracks.length === 0 && r.videos && r.videos.length > 0) {
+        tracks = r.videos.slice(0, 5);
+      }
+
+      if (!tracks || tracks.length === 0) {
         return await ctx.api.editMessageText(
           ctx.chat.id,
           searchWait.message_id,
@@ -460,7 +548,8 @@ bot.on("message:text", async (ctx) => {
       const numEmojis = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"];
       tracks.forEach((track, index) => {
         msgText += `${numEmojis[index]} <b>${track.title}</b> (${track.timestamp})\n`;
-        keyboard.text(numEmojis[index], `dltrack:${searchId}:${index}`);
+        const cb = track.videoId ? `dl:${track.videoId}` : `dltrack:${searchId}:${index}`;
+        keyboard.text(numEmojis[index], cb);
       });
 
       msgText += `\n👇 <i>Yuklab olish uchun pastdagi raqamni bosing:</i>`;
